@@ -7,7 +7,9 @@
 
 -- Load libraries
 
-local bit32 = bit32 or bit or require('bit');
+local bit32  = bit32 or bit or require('bit');
+local string = string;
+local math   = math;
 
 local Bor, Band, LShift, RShift, Extract = bit32.bor, bit32.band, bit32.lshift, bit32.rshift, bit32.extract;
 local Sub, Byte, Char, Find, Lower, Format, Gmatch = string.sub, string.byte, string.char, string.find, string.lower, string.format, string.gmatch;
