@@ -1,5 +1,5 @@
 --[[
-	Modified by cfgtsp64
+	Modified by 8ch32bit
 
 	I WAS NOT THE ORIGINAL AUTHOR OF THIS PROGRAM! This was originally written by Kein-Hong Man (khman@users.sf.net),
 	original creditgoes to him and any other contributers. This program has been improved both performance wise, and syntax wise.
