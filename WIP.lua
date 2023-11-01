@@ -1,5 +1,5 @@
 --[[
-	Modified by 8ch32bit
+	Modified by cfgtsp64
 
 	I WAS NOT THE ORIGINAL AUTHOR OF THIS PROGRAM! This was originally written by Kein-Hong Man (khman@users.sf.net),
 	original creditgoes to him and any other contributers. This program has been improved both performance wise, and syntax wise.
@@ -10,6 +10,7 @@
 local bit32  = bit32 or bit or require('bit');
 local string = string;
 local math   = math;
+local typeof = typeof or type;
 
 local Bor, Band, LShift, RShift, Extract = bit32.bor, bit32.band, bit32.lshift, bit32.rshift, bit32.extract;
 local Sub, Byte, Char, Find, Lower, Format, Gmatch = string.sub, string.byte, string.char, string.find, string.lower, string.format, string.gmatch;
@@ -17,8 +18,8 @@ local Abs, Min, Log, Pow, Fmod, Floor = math.abs, math.min, math.log, math.pow, 
 
 -- Other util funtions
 
-local function IsNaN(a)
-	return not a == a;
+local function lua_Assert(Value, Message) -- Simpler assertion function
+	return Value or error(Message or "assertion failed!");
 end;
 
 local function GrabByte(x)
@@ -42,7 +43,7 @@ local function Frexp(x) -- Faster than lua's builtin (for Lua 5.3+ support/optim
 	local Mantissa, Exponent = 0, 0;
 
 	Exponent = Floor(Log(New, 2)) + 1;
-	Mantissa = New / 2 ^ Exponent;
+	Mantissa = New / (2 ^ Exponent);
 		
 	if Abs(Mantissa) >= 1 then
 		Mantissa = Mantissa / 2;
@@ -67,7 +68,21 @@ do
 	Lua.U = {}; -- String dumper module
 	Lua.K = {}; -- Main compiler module
 
-	local size_t = 8;
+	local SizeSizeT   = 8;
+	local ShortMax    = 32767;
+	local MaxVars     = 200;
+	local MaxUpvalues = 60;
+	local MaxInt      = 2147483645;
+	local MaxCalls    = 200;
+
+	local HasArgMask     = 2;
+	local VarargHasArg   = 1;
+	local VarargIsVararg = 2;
+	local VarargNeedsarg = 4;
+	
+	local MultipleReturn = -1;
+
+	local MaxStack = 250;
 
 	local EOZ    = "EOZ";
 	local Vararg = "...";
@@ -362,14 +377,13 @@ do
 	------------------------------------------------------------------------
 	-- create a chunk reader from a source string
 	------------------------------------------------------------------------
-	function Z:make_getS(buff)
+	function Z:MakeStringReader(Buff)
 		return function() -- chunk reader anonymous function here
-			if not buff then
+			if not Buff then
 				return;
 			end;
 
-			local Data = buff;
-			buff = nil;
+			local Data = Buff; Buff = nil;
 
 			return Data;
 		end;
@@ -378,15 +392,15 @@ do
 	------------------------------------------------------------------------
 	-- create a chunk reader from a source file
 	------------------------------------------------------------------------
-	function Z:make_getF(source)
+	function Z:MakeFileReader(Source)
 		local Position = 1;
-		local Length   = #source;
+		local Length   = #Source;
 
 		local BuffSize  = self.BufferSize;
 		local BuffSize1 = BuffSize - 1;
 
 		return function() -- chunk reader anonymous function here
-			local Buff = Sub(source, Position, Position + BuffSize1); -- Use string.sub() instead of :sub()
+			local Buff = Sub(Source, Position, Position + BuffSize1); -- Use string.sub() instead of :sub()
 			Position = Min(Length + 1, Position + BuffSize);
 
 			return Buff;
@@ -397,34 +411,30 @@ do
 	-- creates a zio input stream
 	-- returns the ZIO structure, Zio
 	------------------------------------------------------------------------
-	function Z:init(reader, data)
-		if not reader then
+	function Z:Init(Reader, Data)
+		if not Reader then
 			return;
 		end;
 
-		return { -- Return zio object
-			Reader = reader,
-			Data   = Data or "",
-			Name   = Name,
+		Data = Data or "";
 
-			P = 0, N = (not data or data == "") and 0 or #data
-		};
+		return { Reader = Reader, Data = Data, P = 0, N = #Data };
 	end;
 
 	------------------------------------------------------------------------
 	-- fill up input buffer
 	------------------------------------------------------------------------
-	function Z:fill(zio)
-		local Buff = zio.Reader();
+	function Z:Fill(Zio)
+		local Buff = Zio.Reader();
 
-		zio.Data = Buff;
+		Zio.Data = Buff;
 
 		if not Buff or Buff == "" then
 			return EOZ;
 		end;
 
-		zio.P = 1;
-		zio.N = #Buff - 1;
+		Zio.P = 1;
+		Zio.N = #Buff - 1;
 
 		return Sub(Buff, 1, 1);
 	end;
@@ -433,18 +443,18 @@ do
 	-- get next character from the input stream
 	-- * local n, p are used to optimize code generation
 	------------------------------------------------------------------------
-	function Z:zgetc(zio)
-		local N = zio.N;
-		local P = zio.P + 1;
+	function Z:GetChar(Zio)
+		local N = Zio.N;
+		local P = Zio.P + 1;
 
 		if N > 0 then
-			zio.N = N - 1;
-			zio.P = P;
+			Zio.N = N - 1;
+			Zio.P = P;
 
-			return Sub(zio.Data, P, P);
+			return Sub(Zio.Data, P, P);
 		end;
 
-		return self:fill(zio);
+		return self:Fill(Zio);
 	end;
 
 	-- FIRST_RESERVED is not required as tokens are manipulated as strings
@@ -483,16 +493,17 @@ do
 	-- * luaX.tokens: TK_* -> token
 	-- * luaX.enums:  token -> TK_* (used in luaX:llex)
 	------------------------------------------------------------------------
-	function X:init()
-		local Tokens, Enums = {}, {};
+	function X:Init()
+		local Tokens = {};
+		local Enums  = {};
 
 		local Reserved = self.RESERVED;
 
 		for V in Gmatch(Reserved, "[^\n]+") do
 			local _, _, Tok, Str = Find(V, "(%S+)%s+(%S+)");
 
-			Tokens[tok] = Str;
-			Enums[str]  = Tok;
+			Tokens[Tok] = Str;
+			Enums[Str]  = Tok;
 		end;
 
 		self.Tokens = Tokens;
@@ -504,40 +515,40 @@ do
 	-- * from lobject.c, used in llex.c and ldebug.c
 	-- * the result, out, is returned (was first argument)
 	------------------------------------------------------------------------
-	function X:chunkid(source, buffLength)
+	function X:GetChunkID(Source, BuffLength)
 		local Output = "";
 
-		local First = Sub(source, 1, 1);
+		local First = Sub(Source, 1, 1);
 
 		if First == "=" then
-			Output = Sub(source, 2, buffLength);  -- remove first char
+			Output = Sub(Source, 2, buffLength);  -- remove first char
 		else  -- out = "source", or "...source"
-			local Length = #source;
+			local Length = #Source;
 
 			if First == "@" then
-				source = Sub(source, 2);  -- skip the '@'
+				Source = Sub(Source, 2);  -- skip the '@'
 				
-				buffLength = buffLength - 8; -- bufflen = bufflen - #(" '...' ");
+				BuffLength = buffLength - 8; -- bufflen = bufflen - #(" '...' ");
 
 				if Length > buffLength then
-					source = Sub(source, 1 + (Length - buffLength));  -- get last part of file name
+					Source = Sub(Source, 1 + (Length - buffLength));  -- get last part of file name
 					Output = Output .. Vararg;
 				end;
 
-				Output = Output .. source;
+				Output = Output .. Source;
 			else
-				local Len = Find(source, "[\n\r]");  -- stop at first newline
+				local Len = Find(Source, "[\n\r]");  -- stop at first newline
 
 				Len = Len and (Len - 1) or Length;
 
-				buffLength = buffLength - #(" [string \"...\"] ");
+				BuffLength = buffLength - #(" [string \"...\"] ");
 
 				Len = (Len > buffLength) and buffLength or Len;
 
 				Output = "[string \"";
 
 				if Len < Length then  -- must truncate?
-					Output = Output .. Sub(source, 1, Len) .. Vararg;
+					Output = Output .. Sub(Source, 1, Len) .. Vararg;
 				else
 					Output = Output .. source;
 				end;
@@ -634,26 +645,27 @@ do
 	--   otherwise it has to be retrieved as a return value
 	-- * LUA_MINBUFFER not used; buffer handling not required any more
 	------------------------------------------------------------------------
-	function X:setinput(luaState, lexState, zio, source) 
-		lexState = lexState or {}; -- create struct
+	function X:SetInput(LuaState, LexerState, Zio, Source) 
+		LexerState = LexerState or {}; -- create struct
 
-		lexState.Lookahead = lexState.Lookahead or {};
-		lexState.T         = lexState.T or {};
+		LexerState.LookAhead = LexerState.LookAhead or {};
+		LexerState.Tokens    = LexerState.T or {};
 
-		lexState.DecPoint = ".";
+		LexerState.DecPoint = ".";
 
-		lexState.L  = luaState;
-		lexState.Z  = zio;
-		lexState.Fs = nil;
+		LexerState.LuaState  = LuaState;
+		LexerState.Zio       = Zio;
 
-		lexState.LineNumber = 1;
-		lexState.LastLine   = 1;
+		LexerState.FunctionState = nil;
 
-		lexState.Source = source;
+		LexerState.LineNumber = 1;
+		LexerState.LastLine   = 1;
 
-		lexState.Lookahead.Token = "TK_EOS"  -- no look-ahead token
+		LexerState.Source = Source;
 
-		self:nextc(lexState);  -- read first char
+		LexerState.Lookahead.Token = "TK_EOS";  -- no look-ahead token
+
+		self:NextChar(LexerState);  -- read first char
 	end;
 
 	--[[--------------------------------------------------------------------
@@ -819,7 +831,7 @@ do
 			self:save_and_next(lexState);
 		end;
 
-		self:buffreplace(ls, ".", ls.decpoint);  -- follow locale for decimal point
+		self:buffreplace(lexState, ".", lexState.DecPoint);  -- follow locale for decimal point
 		
 		local SemInfo = self:str2d(lexState.Buff);
 
@@ -864,7 +876,7 @@ do
 		while true do
 			local C = lexState.Current;
 
-			if C == "EOZ" then
+			if C == EOZ then
 				self:lexerror(lexState, token and "unfinished long string" or "unfinished long comment", "TK_EOS");
 			elseif C == "[" then
 				if self.LuaLStr then
@@ -928,7 +940,7 @@ do
 		while lexState.current ~= del do
 			local C = lexState.current;
 
-			if C == "EOZ" then
+			if C == EOZ then
 				self:lexerror(lexState, "unfinished string", "TK_EOS");
 			elseif self:currIsNewline(lexState) then
 				self:lexerror(lexState, "unfinished string", "TK_STRING");
@@ -940,8 +952,8 @@ do
 				if self:currIsNewline(lexState) then
 					self:save(lexState, "\n");
 					self:inclinenumber(lexState);
-				elseif C ~= "EOZ" then
-					local I = Find("abfnrtv", C, 1, 1);
+				elseif C ~= EOZ then
+					local I = Find("abfnrtv", C, 1);
 
 					if I then
 						self:save(lexState, Sub("\a\b\f\n\r\t\v", I, I));
@@ -1296,13 +1308,13 @@ do
 	
 	function U:MakeSetF(fileName)
 		local Buff = {};
-		local H = Open(fileName, "wb");
+		local Port = Open(fileName, "wb");
 		
-		if not H then
+		if not Port then
 			return;
 		end;
 
-		Buff.H = H;
+		Buff.H = Port;
 		
 		return function(__string, buff)  -- chunk writer
 			local H = buff.H;
@@ -1316,7 +1328,7 @@ do
 					return 0;
 				end;
 			else
-				if H:write(s) then
+				if H:write(__string) then
 					return 0;
 				end;
 			end;
@@ -1330,11 +1342,11 @@ do
 	-- scripts only has a 'value' field, no 'tt' field (native types used)
 	------------------------------------------------------------------------
 	function U:Type(object)
-		local __type = (typeof ~= nil and typeof or type)(object.value);
+		local __type = typeof(object.Value);
 		
 		local Type = -1;
 		
-		if __type == "nil" then
+		if __type == "nil" then -- Lua needs switch statements smh
 			Type = 0;
 		elseif __type == "boolean" then
 			Type = 1;
@@ -1375,16 +1387,20 @@ do
 			Exponent = Exponent + 1022;
 		end;
 		
-		local Val, Byte = "", "";
+		local Val, Byte;
 		
 		local New = Floor(Mantissa);
 		
 		for _ = 1, 6 do
-			local _, __Byte = GrabByte(New); Val = Val .. __Byte; -- 47:0
+			local __Byte = Char(New % 256);
+			
+			Val = Val .. __Byte; -- 47:0
 		end;
 		
-		Val, Byte = GrabByte(LShift(Exponent, 4) + New); Val = Val .. Byte; -- 55:48
-		Val, Byte = GrabByte(LShift(Sign, 7)     + New); Val = Val .. Byte; -- 63:56
+		Val, Byte = GrabByte(LShift(Exponent, 4) + New);
+		Val = Val .. Byte; -- 55:48
+		Val, Byte = GrabByte(LShift(Sign, 7)     + New);
+		Val = Val .. Byte; -- 63:56
 		
 		return Val;
 	end
@@ -1400,7 +1416,7 @@ do
 		x = x < 0 and 4294967296 + x or x;
 		
 		for _ = 1, 4 do
-			v = v .. Char(x % 256);
+			Val = Val .. Char(x % 256);
 			x = Floor(RShift(x, 8));
 		end;
 		
@@ -1452,7 +1468,7 @@ do
 	function U:DumpSizeT(x, D)
 		self:DumpBlock(self:FromInt(x), D);
 		
-		if size_size_t == 8 then
+		if SizeSizeT == 8 then
 			self:DumpBlock(self:FromInt(0), D);
 		end;
 	end;
@@ -1485,9 +1501,11 @@ do
 		local Size = instr.SizeCode;
 		
 		self:DumpInt(Size, D);
+
+		local Code = instr.Code;
 		
 		for Index = 0, Size - 1 do
-			self:DumpBlock(P:Instruction(Instr.Code[Index]), D);
+			self:DumpBlock(P:Instruction(Code[Index]), D);
 		end;
 	end;
 
@@ -1508,7 +1526,7 @@ do
 		local LUA_TSTRING  = self.LUA_TSTRING;
 		
 		for Index = 0, Size - 1 do
-			local Object = K[i];
+			local Object = K[Index];
 			local Value  = Object.Value;
 			local Type   = self:Type(Object);
 			
@@ -1547,7 +1565,7 @@ do
 			self:DumpInt(LineInfo[Index], D);
 		end;
 		
-		Size = D.Strip and 0 or debug.SizeLocalVars;            -- dump local information
+		Size = D.Strip and 0 or debug.SizeLocalVars; -- dump local information
 		
 		self:DumpInt(Size, D);
 		
@@ -1559,81 +1577,62 @@ do
 			self:DumpInt(Var.EndPC, D);
 		end;
 		
-		Size = D.Strip and 0 or f.SizeUpvalues; -- dump upvalue information
+		Size = D.Strip and 0 or debug.SizeUpvalues; -- dump upvalue information
 		
 		self:DumpInt(Size, D);
 		
 		for Index = 0, Size - 1 do
-			self:DumpString(Upvalues[i], D);
+			self:DumpString(Upvalues[Index], D);
 		end;
 	end;
 
 	------------------------------------------------------------------------
 	-- dump child function prototypes from function prototype
 	------------------------------------------------------------------------
-	function U:DumpFunction(__function, P, D)
-		local Source = __function.Source;
+	function U:DumpFunction(Function, P, D)
+		local Source = Function.Source;
 		
 		if Source == P or D.Strip then
-			Source = nil;
+			Source = P;
 		end;
 		
-		self:DumpString(source, D);
-		self:DumpInt(__function.lineDefined, D);
-		self:DumpInt(__function.lastlinedefined, D);
-		self:DumpChar(__function.nups, D);
-		self:DumpChar(__function.numparams, D);
-		self:DumpChar(__function.is_vararg, D);
-		self:DumpChar(__function.maxstacksize, D);
-		self:DumpCode(__function, D);
-		self:DumpConstants(__function, D);
-		self:DumpDebug(__function, D);
-	end
+		self:DumpString(Source, D);
+		self:DumpInt(Function.lineDefined, D);
+		self:DumpInt(Function.lastlinedefined, D);
+		self:DumpChar(Function.nups, D);
+		self:DumpChar(Function.numparams, D);
+		self:DumpChar(Function.is_vararg, D);
+		self:DumpChar(Function.maxstacksize, D);
 
-	------------------------------------------------------------------------
-	-- dump Lua header section (some sizes hard-coded)
-	------------------------------------------------------------------------
-	function U:DumpHeader(D)
-		local Header = "\27Lua" .. Char(81, 0, 1, 4, size_size_t, 4, 8, 0);
-		
-		assert(#Header == 12) -- fixed buffer now an assert
-		self:DumpBlock(Header, D);
+		self:DumpCode(Function, D);
+		self:DumpConstants(Function, D);
+		self:DumpDebug(Function, D);
 	end;
 
-	------------------------------------------------------------------------
-	-- make header (from lundump.c)
-	-- returns the header string
-	------------------------------------------------------------------------
-	function U:Header()
-		return "\27Lua" .. Char(81, 0, 1, 4, size_size_t, 4, 8, 0);
-	end;
+	local Header = "\27Lua\81\0\1\4" .. Char(SizeSizeT) .. "\4\8\0";
 
 	------------------------------------------------------------------------
 	-- dump Lua function as precompiled chunk
 	-- (lua_State* L, const Proto* f, lua_Writer w, void* data, int strip)
 	-- * w, data are created from make_setS, make_setF
 	------------------------------------------------------------------------
-	function U:Dump(L, __function, writer, data, strip)
-		local D = {};  -- DumpState
-		D.L = L;
-		D.write = writer;
-		D.data  = data;
-		D.strip = strip;
-		D.status = 0;
-		
-		self:DumpHeader(D);
-		self:DumpFunction(__function, nil, D);
-		
-		D.write(nil, data);
-		
-		return D.status;
-	end;
+	function U:Dump(L, Function, Writer, Data, Strip)
+		local DumpState = {};  -- DumpState
 
-	------------------------------------------------------------------------
-	-- constants used by code generator
-	------------------------------------------------------------------------
-	-- maximum stack for a Lua function
-	K.MAXSTACK = 250  -- (from llimits.h)
+		DumpState.L      = L;
+		DumpState.Write  = Writer;
+		DumpState.Data   = Data;
+		DumpState.Strip  = Strip;
+		DumpState.Status = 0;
+		
+		self:DumpBlock(Header, DumpState);
+		self:DumpFunction(Function, nil, DumpState);
+		
+		DumpState.Write(nil, Data);
+		
+		return DumpState.Status;
+	end;
+	local MaxStack = 250;
 
 	--[[--------------------------------------------------------------------
 	-- other functions
@@ -1702,7 +1701,7 @@ do
 	-- Marks the end of a patch list. It is an invalid value both as an absolute
 	-- address, and as a list link (would link an element to itself).
 	------------------------------------------------------------------------
-	K.NO_JUMP = -1;
+	local NO_JUMP = -1;
 
 	------------------------------------------------------------------------
 	-- grep "ORDER OPR" if you change these enums
@@ -1760,9 +1759,9 @@ do
 	-- true if the expression is a constant number (for constant folding)
 	-- * used in constfolding(), infix()
 	------------------------------------------------------------------------
-	function luaK:IsNumeral(e)
-		return e.k == "VKNUM" and e.t == self.NO_JUMP and e.f == self.NO_JUMP
-	end
+	function K:IsNumeral(e)
+		return e.k == "VKNUM" and e.t == NO_JUMP and e.f == NO_JUMP;
+	end;
 
 	------------------------------------------------------------------------
 	-- codes loading of nil, optimization done if consecutive locations
@@ -1772,16 +1771,14 @@ do
 		local PC          = fs.PC;
 		local LastTarget  = fs.LastTarget;
 		local NactVar     = fs.NactVar;
-		local __function  = fs.__function;
+		local Function    = fs.Function;
 
-		local Code = __function.Code;
+		local Code = Function.Code;
 		
 		if PC > LastTarget then  -- no jumps to current position?
 			if PC == 0 then  -- function start?
-				if from >= NactVar then
-					return;  -- positions are already clean
-				end;
-			end
+				if from >= NactVar then	return; end; -- positions are already clean
+			end;
 
 			local previous = Code[PC - 1];
 			
@@ -1789,7 +1786,7 @@ do
 				local A = P:GETARG_A(previous);
 				local B = P:GETARG_B(previous);
 				
-				if A <= from and from <= B + 1 then  -- can connect both?
+				if (A <= from) and (from <= B + 1) then  -- can connect both?
 					if from + n - 1 > B then
 						P:SETARG_B(previous, from + n - 1);
 					end;
@@ -1840,8 +1837,8 @@ do
 	-- * used in luaK:patchlistaux(), luaK:concat()
 	------------------------------------------------------------------------
 	function K:FixJump(fs, pc, destination)
-		local __function = fs.__function;
-		local Code       = __function.Code;
+		local Function = fs.Function;
+		local Code     = Function.Code;
 		
 		local JMP    = Code[pc];
 		local Offset = destination - (pc + 1);
@@ -1872,15 +1869,14 @@ do
 	--   luaK:concat()
 	------------------------------------------------------------------------
 	function K:GetJump(fs, pc)
-		local Code = fs.__function.Code;
-		
+		local Code   = fs.Function.Code;
 		local Offset = P:GETARG_sBx(Code[pc]);
 		
-		if Offset == -1 then  -- point to itself represents end of list
-			return -1;  -- end of list
-		else
-			return (pc + 1) + offset;  -- turn offset into absolute position
+		if Offset == NO_JUMP then  -- point to itself represents end of list
+			return NO_JUMP;  -- end of list
 		end;
+
+		return (pc + 1) + Offset;  -- turn offset into absolute position
 	end;
 
 	------------------------------------------------------------------------
@@ -1888,13 +1884,13 @@ do
 	-- * used in luaK:need_value(), luaK:patchtestreg(), luaK:invertjump()
 	------------------------------------------------------------------------
 	function K:GetJumpControl(fs, pc)
-		local Code = fs.__function.Code;
+		local Code = fs.Function.Code;
 		
 		local InstrA = Code[pc];
 		local InstrB = Code[pc - 1];
 		
-		if pc >= 1 and P:TestTMode(P:GET_OPCODE(InstrA)) ~= 0 then
-			return InstrA;
+		if pc >= 1 then
+			if P:TestTMode(P:GET_OPCODE(InstrA)) ~= 0 then return InstrA; end;
 		end;
 
 		return InstrB;
@@ -1907,10 +1903,10 @@ do
 	-- * used only in luaK:exp2reg()
 	------------------------------------------------------------------------
 	function K:NeedValue(fs, list)
-		while list ~= -1 do
-			local JMPCtrl = self:GetJumpControl(fs, list);
+		while list ~= NO_JUMP do
+			local JumpControl = self:GetJumpControl(fs, list);
 			
-			if P:GET_OPCODE(JMPCtrl) ~= "OP_TESTSET" then
+			if P:GET_OPCODE(JumpControl) ~= "OP_TESTSET" then
 				return true;
 			end;
 			
@@ -1927,20 +1923,18 @@ do
 	-- * used in luaK:removevalues(), luaK:patchlistaux()
 	------------------------------------------------------------------------
 	function K:PatchTestReg(fs, node, reg)
-		local JMPCtrl = self:GetJumpControl(fs, node);
+		local JMPCtrl      = self:GetJumpControl(fs, node);
+		local JMPCtrl_ArgB = P:GETARG_B(JMPCtrl);
 		
-		if P:GET_OPCODE(JMPCtrl) ~= "OP_TESTSET" then
-			return false;  -- cannot patch other instructions
+		if JMPCtrl_ArgB ~= "OP_TESTSET" then
+			return false; -- cannot patch other instructions
 		end;
 		
-		if reg ~= NO_REG and reg ~= P:GETARG_B(JMPCtrl) then
+		if reg ~= NO_REG and reg ~= JMPCtrl_ArgB then
 			P:SETARG_A(JMPCtrl, reg);
 		else
-			P:SET_OPCODE(JMPCtrl, "OP_TEST");
-			
-			local B = P:GETARG_B(JMPCtrl);
-			
-			P:SETARG_A(i, b);
+			P:SET_OPCODE(JMPCtrl, "OP_TEST");			
+			P:SETARG_A(i, JMPCtrl_ArgB);
 			P:SETARG_B(i, 0);
 		end;
 		
@@ -2003,7 +1997,7 @@ do
 	function K:PatchToHere(fs, list)
 		self:GetLabel(fs);
 		
-		fs.jpc = self:Concat(fs, fs.jpc, list);
+		fs.Jpc = self:Concat(fs, fs.Jpc, list);
 	end
 
 	------------------------------------------------------------------------
@@ -2011,21 +2005,23 @@ do
 	-- * used in multiple locations
 	------------------------------------------------------------------------
 	function K:Concat(fs, list1, list2)
-		if list2 == -1 then
+		if list2 == NO_JUMP then
 			return list1;
-		elseif list1 == -1 then
-			return list2;
-		else
-			local List = list1;
-			local Next = self:GetJump(fs, List);
-			
-			while Next ~= -1 do  -- find last element
-				List = Next;
-				Next = self:GetJump(fs, list);
-			end;
-			
-			self:FixJump(fs, list, l2);
 		end;
+		
+		if list1 == NO_JUMP then
+			return list2;
+		end;
+
+		local List = list1;
+		local Next = self:GetJump(fs, List);
+			
+		while Next ~= NO_JUMP do -- find last element
+			List = Next;
+			Next = self:GetJump(fs, List);
+		end;
+			
+		self:FixJump(fs, List, list2);
 		
 		return list1;
 	end;
@@ -2877,23 +2873,7 @@ do
 	-- constants used by parser
 	-- * picks up duplicate values from luaX if required
 	------------------------------------------------------------------------
-	luaY.LUA_QS = luaX.LUA_QS or "'%s'"  -- (from luaconf.h)
-
-	luaY.SHRT_MAX = 32767 -- (from <limits.h>)
-	luaY.LUAI_MAXVARS = 200  -- (luaconf.h)
-	luaY.LUAI_MAXUPVALUES = 60  -- (luaconf.h)
-	luaY.MAX_INT = luaX.MAX_INT or 2147483645  -- (from llimits.h)
-		-- * INT_MAX-2 for 32-bit systems
-	luaY.LUAI_MAXCCALLS = 200  -- (from luaconf.h)
-
-	luaY.VARARG_HASARG = 1  -- (from lobject.h)
-	-- NOTE: HASARG_MASK is value-specific
-	luaY.HASARG_MASK = 2 -- this was added for a bitop in parlist()
-	luaY.VARARG_ISVARARG = 2
-	-- NOTE: there is some value-specific code that involves VARARG_NEEDSARG
-	luaY.VARARG_NEEDSARG = 4
-
-	luaY.LUA_MULTRET = -1  -- (lua.h)
+	-- luaY.LUA_QS = X.LUA_QS or "'%s'"  -- (from luaconf.h)
 
 	--[[--------------------------------------------------------------------
 	-- other functions
@@ -2903,9 +2883,9 @@ do
 	-- LUA_QL describes how error messages quote program elements.
 	-- CHANGE it if you want a different appearance. (from luaconf.h)
 	------------------------------------------------------------------------
-	function luaY:LUA_QL(x)
-		return "'"..x.."'"
-	end
+	function Y:LUA_QL(x)
+		return Format("'%s'", x);
+	end;
 
 	------------------------------------------------------------------------
 	-- this is a stripped-down luaM_growvector (from lmem.h) which is a
@@ -2917,39 +2897,43 @@ do
 	-- * size (originally a pointer) is never updated, their final values
 	--   are set by luaY:close_func(), so overall things should still work
 	------------------------------------------------------------------------
-	function luaY:growvector(L, v, nelems, size, t, limit, e)
-		if nelems >= limit then
-			error(e)  -- was luaG_runerror
-		end
-	end
+	function Y:GrowVector(LuaState, V, NumberOfElements, Size, T, Limit, Message)
+		return (NumberOfElements >= Limit) and error(Message or "overran limit!") or NumberOfElements;
+	end;
 
 	------------------------------------------------------------------------
 	-- initialize a new function prototype structure (from lfunc.c)
 	-- * used only in open_func()
 	------------------------------------------------------------------------
-	function luaY:newproto(L)
-		local f = {} -- Proto
-		-- luaC_link(L, obj2gco(f), LUA_TPROTO); /* GC */
-		f.k = {}
-		f.sizek = 0
-		f.p = {}
-		f.sizep = 0
-		f.code = {}
-		f.sizecode = 0
-		f.sizelineinfo = 0
-		f.sizeupvalues = 0
-		f.nups = 0
-		f.upvalues = {}
-		f.numparams = 0
-		f.is_vararg = 0
-		f.maxstacksize = 0
-		f.lineinfo = {}
-		f.sizelocvars = 0
-		f.locvars = {}
-		f.lineDefined = 0
-		f.lastlinedefined = 0
-		f.source = nil
-		return f
+
+	function Y:NewProto() -- It never needed the state as an argument?
+		local FunctionState = {};
+
+		FunctionState.Source = nil;
+
+		FunctionState.LineDefined     = 0;
+		FunctionState.LastLineDefined = 0;
+		FunctionState.MaxStackSize    = 0;
+		FunctionState.NUps            = 0;
+		FunctionState.NumParams       = 0;
+
+		FunctionState.IsVararg = 0;
+		
+		FunctionState.K        = {};
+		FunctionState.P        = {};
+		FunctionState.Code     = {};
+		FunctionState.Upvalues = {};
+		FunctionState.LineInfo = {};
+		FunctionState.LocVars  = {};
+
+		FunctionState.SizeK        = 0;
+		FunctionState.SizeP        = 0;
+		FunctionState.SizeCode     = 0;
+		FunctionState.SizeUpvalues = 0;
+		FunctionState.SizeLineInfo = 0;
+		FunctionState.SizeLocVars  = 0;
+
+		return FunctionState;
 	end
 
 	------------------------------------------------------------------------
@@ -2957,18 +2941,19 @@ do
 	-- (eeeeexxx), where the real value is (1xxx) * 2^(eeeee - 1) if
 	-- eeeee != 0 and (xxx) otherwise.
 	------------------------------------------------------------------------
-	function luaY:int2fb(x)
-		local e = 0  -- exponent
+	function Y:Int2FloatingPoint(x)
+		local Exponent = 0;
+
 		while x >= 16 do
-			x = math.floor((x + 1) / 2)
-			e = e + 1
-		end
-		if x < 8 then
-			return x
-		else
-			return ((e + 1) * 8) + (x - 8)
-		end
-	end
+			x = (x + 1) / 2;
+			x = x - (x % 1);
+
+			Exponent = Exponent + 1;
+		end;
+
+		if x < 8 then return x; end;
+		return ((Exponent + 1) * 8) + (x - 8);
+	end;
 
 	--[[--------------------------------------------------------------------
 	-- parser functions
@@ -2977,23 +2962,23 @@ do
 	------------------------------------------------------------------------
 	-- true of the kind of expression produces multiple return values
 	------------------------------------------------------------------------
-	function luaY:hasmultret(k)
-		return k == "VCALL" or k == "VVARARG"
-	end
+	function Y:HasMultipleReturns(K)
+		return K == "VCALL" or K == "VVARARG;"
+	end;
 
 	------------------------------------------------------------------------
 	-- convenience function to access active local i, returns entry
 	------------------------------------------------------------------------
-	function luaY:getlocvar(fs, i)
-		return fs.f.locvars[ fs.actvar[i] ]
-	end
+	function Y:GetLocalVar(FunctionState, Idx)
+		return FunctionState.F.LocVars[FunctionState.ActVars[Idx]];
+	end;
 
 	------------------------------------------------------------------------
 	-- check a limit, string m provided as an error message
 	------------------------------------------------------------------------
-	function luaY:checklimit(fs, v, l, m)
-		if v > l then self:errorlimit(fs, l, m) end
-	end
+	function Y:CheckLimit(FunctionState, Value, Limit, Message)
+		return (Value > Limit and self:ErrorLimit(FunctionState, Limit, Message)) or Value;
+	end;
 
 	--[[--------------------------------------------------------------------
 	-- nodes for block list (list of active blocks)
@@ -3014,175 +2999,212 @@ do
 	-- reanchor if last token is has a constant string, see close_func()
 	-- * used only in close_func()
 	------------------------------------------------------------------------
-	function luaY:anchor_token(ls)
-		if ls.t.token == "TK_NAME" or ls.t.token == "TK_STRING" then
+	function Y:AnchorToken(LexerState)
+		--[[
+		local Token = LexerState.T.Token;
+
+		if Token == "TK_NAME" or Token == "TK_STRING" then
 			-- not relevant to Lua implementation of parser
-			-- local ts = ls.t.seminfo
 			-- luaX_newstring(ls, getstr(ts), ts->tsv.len); /* C */
-		end
-	end
+		end;
+		]]
+	end;
 
 	------------------------------------------------------------------------
 	-- throws a syntax error if token expected is not there
 	------------------------------------------------------------------------
-	function luaY:error_expected(ls, token)
-		luaX:syntaxerror(ls,
-			string.format(self.LUA_QS.." expected", luaX:token2str(ls, token)))
-	end
+	function Y:ErrorExpected(LexerState, Token)
+		X:SyntaxError(LexerState, Format("%s expected", X:Token2Str(LexerState, Token)));
+	end;
 
 	------------------------------------------------------------------------
 	-- prepares error message for display, for limits exceeded
 	-- * used only in checklimit()
 	------------------------------------------------------------------------
-	function luaY:errorlimit(fs, limit, what)
-		local msg = (fs.f.linedefined == 0) and
-			string.format("main function has more than %d %s", limit, what) or
-			string.format("function at line %d has more than %d %s",
-										fs.f.linedefined, limit, what)
-		luaX:lexerror(fs.ls, msg, 0)
+	local LimitErrMessage1 = "main function has more than %d %s";
+	local LimitErrMessage2 = "function at line %d has more than %d %s";
+
+	function Y:ErrorLimit(FunctionState, Limit, What)
+		local LineDefined = FunctionState.F.LineDefined;
+
+		X:LexError(FunctionState.LexerState, LineDefined == 0 and Format(LimitErrMessage1, Limit, What) or Format(LimitErrMessage2, LineDefined, Limit, What), 0);
 	end
 
 	------------------------------------------------------------------------
 	-- tests for a token, returns outcome
 	-- * return value changed to boolean
 	------------------------------------------------------------------------
-	function luaY:testnext(ls, c)
-		if ls.t.token == c then
-			luaX:next(ls)
-			return true
-		else
-			return false
-		end
-	end
+	function Y:TestNext(LexerState, C)
+		local Condition = LexerState.T.Token == C;
+
+		if Condition then
+			X:Next(LexerState);
+		end;
+
+		return Condition;
+	end;
 
 	------------------------------------------------------------------------
 	-- check for existence of a token, throws error if not found
 	------------------------------------------------------------------------
-	function luaY:check(ls, c)
-		if ls.t.token ~= c then
-			self:error_expected(ls, c)
-		end
-	end
+	function Y:Check(LexerState, C)
+		if LexerState.T.Token ~= C then
+			self:error_expected(LexerState, C);
+		end;
+	end;
 
 	------------------------------------------------------------------------
 	-- verify existence of a token, then skip it
 	------------------------------------------------------------------------
-	function luaY:checknext(ls, c)
-		self:check(ls, c)
-		luaX:next(ls)
-	end
+	function Y:CheckNext(LexerState, C)
+		if LexerState.T.Token ~= C then
+			self:ErrorExpected(LexerState, C);
+		end;
+
+		X:Next(LexerState);
+	end;
 
 	------------------------------------------------------------------------
 	-- throws error if condition not matched
 	------------------------------------------------------------------------
-	function luaY:check_condition(ls, c, msg)
-		if not c then luaX:syntaxerror(ls, msg) end
-	end
+	function Y:CheckCondition(LexerState, Condition, Message)
+		return Condition or X:SyntaxError(LexerState, Message);
+	end;
 
 	------------------------------------------------------------------------
 	-- verifies token conditions are met or else throw error
 	------------------------------------------------------------------------
-	function luaY:check_match(ls, what, who, where)
-		if not self:testnext(ls, what) then
-			if where == ls.linenumber then
-				self:error_expected(ls, what)
-			else
-				luaX:syntaxerror(ls, string.format(
-					self.LUA_QS.." expected (to close "..self.LUA_QS.." at line %d)",
-					luaX:token2str(ls, what), luaX:token2str(ls, who), where))
-			end
-		end
-	end
+	function Y:CheckMatch(LexerState, What, Who, Where)
+		self:TestNext(LexerState, What);
+
+		if Where == LexerState.LineNumber then
+			self:ErrorExpected(LexerState, What);
+		end;
+
+		X:SyntaxError(LexerState, Format("%s expected (to close %s at line %d)", X:Token2Str(LexerState, What), X:Token2Str(LexerState, Who), Where));
+	end;
 
 	------------------------------------------------------------------------
 	-- expect that token is a name, return the name
 	------------------------------------------------------------------------
-	function luaY:str_checkname(ls)
-		self:check(ls, "TK_NAME")
-		local ts = ls.t.seminfo
-		luaX:next(ls)
-		return ts
-	end
+	function Y:CheckStringName(LexerState)
+		self:Check(LexerState, "TK_NAME");
+		local SemInfo = LexerState.T.SemInfo;
+
+		X:Next(LexerState);
+
+		return SemInfo;
+	end;
 
 	------------------------------------------------------------------------
 	-- initialize a struct expdesc, expression description data structure
 	------------------------------------------------------------------------
-	function luaY:init_exp(e, k, i)
-		e.f, e.t = luaK.NO_JUMP, luaK.NO_JUMP
-		e.k = k
-		e.info = i
-	end
+	function Y:InitExpression(Expression, _K, Info)
+		Expression.F    = NO_JUMP;
+		Expression.T    = NO_JUMP;
+		Expression.K    = _K;
+		Expression.Info = Info;
+	end;
 
 	------------------------------------------------------------------------
 	-- adds given string s in string pool, sets e as VK
 	------------------------------------------------------------------------
-	function luaY:codestring(ls, e, s)
-		self:init_exp(e, "VK", luaK:stringK(ls.fs, s))
-	end
+	function Y:CodeString(LexerState, Expression, String)
+		self:InitExpression(Expression, "VK", K:StringK(LexerState.FunctionState, String));
+	end;
 
 	------------------------------------------------------------------------
 	-- consume a name token, adds it to string pool, sets e as VK
 	------------------------------------------------------------------------
-	function luaY:checkname(ls, e)
-		self:codestring(ls, e, self:str_checkname(ls))
-	end
+	function Y:CheckName(LexerState, Expression)
+		self:CodeString(LexerState, Expression, self:CheckStringName(LexerState));
+	end;
 
 	------------------------------------------------------------------------
 	-- creates struct entry for a local variable
 	-- * used only in new_localvar()
 	------------------------------------------------------------------------
-	function luaY:registerlocalvar(ls, varname)
-		local fs = ls.fs
-		local f = fs.f
-		self:growvector(ls.L, f.locvars, fs.nlocvars, f.sizelocvars,
-										nil, self.SHRT_MAX, "too many local variables")
+	function Y:RegisterLocalVar(LexerState, VarName)
+		local F             = LexerState.F;
+		local FunctionState = LexerState.FunctionState;
+
+		self:GrowVector(LexerState.L, F.LocVars, FunctionState.nlocvars, F.SizeLocVars, nil, self.SHRT_MAX, "too many local variables");
 		-- loop to initialize empty f.locvar positions not required
-		f.locvars[fs.nlocvars] = {} -- LocVar
-		f.locvars[fs.nlocvars].varname = varname
-		-- luaC_objbarrier(ls.L, f, varname) /* GC */
-		local nlocvars = fs.nlocvars
-		fs.nlocvars = fs.nlocvars + 1
-		return nlocvars
-	end
+
+		local NLocVars = FunctionState.NLocVars;
+
+		F.LocVars[NLocVars] = { VarName = VarName }; -- LocVar
+
+		NLocVars = NLocVars + 1;
+
+		FunctionState.NLocVars = NLocVars;
+
+		return NLocVars;
+	end;
 
 	------------------------------------------------------------------------
 	-- creates a new local variable given a name and an offset from nactvar
 	-- * used in fornum(), forlist(), parlist(), body()
 	------------------------------------------------------------------------
-	function luaY:new_localvarliteral(ls, v, n)
-		self:new_localvar(ls, v, n)
-	end
+	function Y:NewLocalVarLiteral(...)
+		self:NewLocalVar(...);
+	end;
 
 	------------------------------------------------------------------------
 	-- register a local variable, set in active variable list
 	------------------------------------------------------------------------
-	function luaY:new_localvar(ls, name, n)
-		local fs = ls.fs
-		self:checklimit(fs, fs.nactvar + n + 1, self.LUAI_MAXVARS, "local variables")
-		fs.actvar[fs.nactvar + n] = self:registerlocalvar(ls, name)
-	end
+	function Y:NewLocalVar(LexerState, Name, N)
+		local FunctionState = LexerState.FunctionState;
+
+		local NewNactVar = FunctionState.NactVar + N;
+
+		self:CheckLimit(FunctionState, NewNactVar + 1, self.LUAI_MAXVARS, "local variables");
+
+		FunctionState.ActVar[NewNactVar] = self:RegisterLocalVar(LexerState, Name);
+	end;
 
 	------------------------------------------------------------------------
 	-- adds nvars number of new local variables, set debug information
 	------------------------------------------------------------------------
-	function luaY:adjustlocalvars(ls, nvars)
-		local fs = ls.fs
-		fs.nactvar = fs.nactvar + nvars
-		for i = nvars, 1, -1 do
-			self:getlocvar(fs, fs.nactvar - i).startpc = fs.pc
-		end
-	end
+	function Y:AdjustLocalVars(LexerState, NVars)
+		local FunctionState = LexerState.FunctionState;
+		local NactVar       = FunctionState.NactVar;
+		local Pc            = FunctionState.Pc;
+
+		FunctionState.NactVar = NactVar + NVars;
+
+		for Idx = NVars, 1, -1 do
+			self:GetLocalVar(FunctionState, NactVar - Idx).StartPc = Pc;
+		end;
+	end;
+
+	function Y:AdjustLocalVarsFromFS(FunctionState, NVars)
+		local NactVar       = FunctionState.NactVar;
+		local Pc            = FunctionState.Pc;
+
+		FunctionState.NactVar = NactVar + NVars;
+
+		for Idx = NVars, 1, -1 do
+			self:GetLocalVar(FunctionState, NactVar - Idx).StartPc = Pc;
+		end;
+	end;
 
 	------------------------------------------------------------------------
 	-- removes a number of locals, set debug information
 	------------------------------------------------------------------------
-	function luaY:removevars(ls, tolevel)
-		local fs = ls.fs
-		while fs.nactvar > tolevel do
-			fs.nactvar = fs.nactvar - 1
-			self:getlocvar(fs, fs.nactvar).endpc = fs.pc
-		end
-	end
+	function Y:RemoveVars(LexerState, ToLevel)
+		local FunctionState = LexerState.FunctionState;
+		local NactVar       = FunctionState.NactVar;
+		local Pc            = FunctionState.Pc;
+
+		while NactVar > ToLevel do
+			NactVar = NactVar - 1;
+
+			FunctionState.NactVar = NactVar;
+			
+			self:GetLocVar(FunctionState, NactVar).EndPc = Pc;
+		end;
+	end;
 
 	------------------------------------------------------------------------
 	-- returns an existing upvalue index based on the given name, or
@@ -3368,83 +3390,101 @@ do
 	------------------------------------------------------------------------
 	-- opening of a function
 	------------------------------------------------------------------------
-	function luaY:open_func(ls, fs)
-		local L = ls.L
-		local f = self:newproto(ls.L)
-		fs.f = f
-		fs.prev = ls.fs  -- linked list of funcstates
-		fs.ls = ls
-		fs.L = L
-		ls.fs = fs
-		fs.pc = 0
-		fs.lasttarget = -1
-		fs.jpc = luaK.NO_JUMP
-		fs.freereg = 0
-		fs.nk = 0
-		fs.np = 0
-		fs.nlocvars = 0
-		fs.nactvar = 0
-		fs.bl = nil
-		f.source = ls.source
-		f.maxstacksize = 2  -- registers 0/1 are always valid
-		fs.h = {}  -- constant table; was luaH_new call
-		-- anchor table of constants and prototype (to avoid being collected)
-		-- sethvalue2s(L, L->top, fs->h); incr_top(L); /* C */
-		-- setptvalue2s(L, L->top, f); incr_top(L);
+	function Y:OpenFunction(ls, fs)
+		local L = ls.L;
+		local F = self:NewProto(L);
+
+		fs.F    = F;
+		fs.Prev = ls.Fs;  -- linked list of funcstates
+		fs.Ls   = ls;
+		fs.L    = L;
+		ls.Fs   = fs;
+		fs.Pc   = 0;
+
+		fs.LastTarget = NO_JUMP;
+		fs.Jpc        = NO_JUMP;
+		fs.FreeReg    = 0;
+
+		fs.Nk = 0;
+		fs.Np = 0;
+
+		fs.NLocVars = 0;
+		fs.NactVar  = 0;
+
+		fs.Bl = nil;
+
+		fs.H = {};  -- constant table; was luaH_new call
+
+		F.MaxStackSsizeource        = ls.source;
+		F.MaxStackSsize = 2; -- registers 0/1 are always valid
 	end
 
 	------------------------------------------------------------------------
 	-- closing of a function
 	------------------------------------------------------------------------
-	function luaY:close_func(ls)
-		local L = ls.L
-		local fs = ls.fs
-		local f = fs.f
-		self:removevars(ls, 0)
-		luaK:ret(fs, 0, 0)  -- final return
-		-- luaM_reallocvector deleted for f->code, f->lineinfo, f->k, f->p,
-		-- f->locvars, f->upvalues; not required for Lua table arrays
-		f.sizecode = fs.pc
-		f.sizelineinfo = fs.pc
-		f.sizek = fs.nk
-		f.sizep = fs.np
-		f.sizelocvars = fs.nlocvars
-		f.sizeupvalues = f.nups
-		--lua_assert(luaG_checkcode(f))  -- currently not implemented
-		lua_assert(fs.bl == nil)
-		ls.fs = fs.prev
-		-- the following is not required for this implementation; kept here
-		-- for completeness
-		-- L->top -= 2;  /* remove table and prototype from the stack */
-		-- last token read was anchored in defunct function; must reanchor it
-		if fs then self:anchor_token(ls) end
+	function Y:CloseFunction(ls)
+		local L  = ls.L;
+		local fs = ls.fs;
+		local f  = fs.f;
+
+		self:RemoveVars(ls, 0);
+		K:Return(fs, 0, 0);
+
+		local Pc = fs.Pc;
+
+		f.Sizecode     = Pc;
+		f.Sizelineinfo = Pc;
+
+		f.SizeK = fs.Nk;
+		f.SizeP = fs.Np;
+
+		f.SizeLocVars  = fs.NLocVars;
+		f.SizeUpvalues = f.NUps;
+
+		assert(fs.bl == nil);
+
+		ls.fs = fs.prev;
+
+		if fs then
+			self:AnchorToken(ls);
+		end;
 	end
 
 	------------------------------------------------------------------------
 	-- parser initialization function
 	-- * note additional sub-tables needed for LexState, FuncState
 	------------------------------------------------------------------------
-	function luaY:parser(L, z, buff, name)
-		local lexstate = {}  -- LexState
-					lexstate.t = {}
-					lexstate.lookahead = {}
-		local funcstate = {}  -- FuncState
-					funcstate.upvalues = {}
-					funcstate.actvar = {}
-		-- the following nCcalls initialization added for convenience
-		L.nCcalls = 0
-		lexstate.buff = buff
-		luaX:setinput(L, lexstate, z, name)
-		self:open_func(lexstate, funcstate)
-		funcstate.f.is_vararg = self.VARARG_ISVARARG  -- main func. is always vararg
-		luaX:next(lexstate)  -- read first token
-		self:chunk(lexstate)
-		self:check(lexstate, "TK_EOS")
-		self:close_func(lexstate)
-		lua_assert(funcstate.prev == nil)
-		lua_assert(funcstate.f.nups == 0)
-		lua_assert(lexstate.fs == nil)
-		return funcstate.f
+	function Y:Parser(L, z, Buff, name)
+		local LexerState = {}  -- LexState
+
+		LexerState.T         = {};
+		LexerState.LookAhead = {};
+
+		local FunctionState = {}; -- FuncState
+
+		FunctionState.upvalues = {}
+		FunctionState.actvar = {}
+
+		L.NumberCalls = 0;
+
+		LexerState.Buff = Buff;
+		X:SetInput(L, LexerState, z, name);
+
+		self:OpenFunction(LexerState, FunctionState);
+
+		FunctionState.f.is_vararg = self.VARARG_ISVARARG  -- main func. is always vararg
+		X:Next(LexerState);  -- read first token
+
+		self:Chunk(LexerState);
+		self:Check(LexerState, "TK_EOS");
+
+		self:CloseFunction(LexerState);
+		
+		lua_Assert(FunctionState.prev == nil);
+		lua_Assert(FunctionState.f.nups == 0);
+		lua_Assert(FunctionState.fs == nil);
+
+		return FunctionState.f;
 	end
 
 	--[[--------------------------------------------------------------------
@@ -3792,31 +3832,38 @@ do
 	-- parses general expression types, constants handled here
 	-- * used in subexpr()
 	------------------------------------------------------------------------
-	function luaY:simpleexp(ls, v)
+	function Y:SimpleExpression(LexerState, V)
 		-- simpleexp -> NUMBER | STRING | NIL | TRUE | FALSE | ... |
 		--              constructor | FUNCTION body | primaryexp
-		local c = ls.t.token
-		if c == "TK_NUMBER" then
-			self:init_exp(v, "VKNUM", 0)
-			v.nval = ls.t.seminfo
+		local T = LexerState.T;
+		local C = T.Token;
+
+		if C == "TK_NUMBER" then
+			self:InitExpression(V, "VKNUM", 0);
+
+			V.NVal = T.SemInfo;
 		elseif c == "TK_STRING" then
-			self:codestring(ls, v, ls.t.seminfo)
+			self:CodeString(LexerState, V, T.SemInfo);
 		elseif c == "TK_NIL" then
-			self:init_exp(v, "VNIL", 0)
+			self:InitExpression(V, "VNIL", 0);
 		elseif c == "TK_TRUE" then
-			self:init_exp(v, "VTRUE", 0)
+			self:InitExpression(V, "VTRUE", 0);
 		elseif c == "TK_FALSE" then
-			self:init_exp(v, "VFALSE", 0)
+			self:InitExpression(V, "VFALSE", 0);
 		elseif c == "TK_DOTS" then  -- vararg
-			local fs = ls.fs
-			self:check_condition(ls, fs.f.is_vararg ~= 0,
-											"cannot use "..self:LUA_QL("...").." outside a vararg function");
-			-- NOTE: the following substitutes for a bitop, but is value-specific
-			local is_vararg = fs.f.is_vararg
-			if is_vararg >= self.VARARG_NEEDSARG then
-				fs.f.is_vararg = is_vararg - self.VARARG_NEEDSARG  -- don't need 'arg'
-			end
-			self:init_exp(v, "VVARARG", luaK:codeABC(fs, "OP_VARARG", 0, 1, 0))
+			local FunctionState = LexerState.fs;
+			local Function      = FunctionState.F;
+			local IsVararg      = Function.IsVararg;
+
+			self:CheckCondition(FunctionState, IsVararg ~= 0, "cannot use "..self:LUA_QL("...").." outside a vararg function");
+
+			local VARARG_NEEDSARG = self.VARARG_NEEDSARG;
+
+			if IsVararg >= VARARG_NEEDSARG then
+				Function.IsVararg = IsVararg - VARARG_NEEDSARG;  -- don't need 'arg'
+			end;
+
+			self:InitExpression(V, "VVARARG", K:CodeABC(FunctionState, "OP_VARARG", 0, 1, 0));
 		elseif c == "{" then  -- constructor
 			self:constructor(ls, v)
 			return
@@ -3836,24 +3883,24 @@ do
 	-- OPR_NOUNOPR. getunopr() and getbinopr() are used in subexpr().
 	-- * used in subexpr()
 	------------------------------------------------------------------------
-	function luaY:getunopr(op)
-		if op == "TK_NOT" then
-			return "OPR_NOT"
-		elseif op == "-" then
-			return "OPR_MINUS"
-		elseif op == "#" then
-			return "OPR_LEN"
-		else
-			return "OPR_NOUNOPR"
-		end
-	end
+	function Y:GetUnaryOperator(Op)
+		if Op == "TK_NOT" then
+			return "OPR_NOT";
+		end;
+
+		if Op == "TK_NOT" then
+			return "OPR_NOT";
+		end;
+
+		return (Op == "-" and "OPR_MINUS") or (Op == "#" and "OPR_LEN") or "OPR_NOUNOPR";
+	end;
 
 	------------------------------------------------------------------------
 	-- Translates binary operator tokens if found, otherwise returns
 	-- OPR_NOBINOPR. Code generation uses OPR_* style tokens.
 	-- * used in subexpr()
 	------------------------------------------------------------------------
-	luaY.getbinopr_table = {
+	Y.getbinopr_table = {
 		["+"] = "OPR_ADD",
 		["-"] = "OPR_SUB",
 		["*"] = "OPR_MUL",
@@ -4484,15 +4531,11 @@ do
 			ls.fs.freereg = ls.fs.nactvar  -- free registers
 		end
 		self:leavelevel(ls)
-	end
+	end;
 
 	-- }======================================================================
 
-
-
-
-
-	luaX:init()  -- required by llex
+	X:init()  -- required by llex
 	local LuaState = {}  -- dummy, not actually used, but retained since the intention is to complete a straight port
 
 	------------------------------------------------------------------------
@@ -4502,7 +4545,7 @@ do
 	Compile = function(source, name)
 		name = name or 'compiled-lua';
 
-		local Zio = Z:Init(Z:MakeGetF(source), nil);
+		local Zio = Z:Init(Z:MakeStringReader(source), nil);
 
 		local __function = Y:Parser(LuaState, zio, nil, "@" .. name);
 		
