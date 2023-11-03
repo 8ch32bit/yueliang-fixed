@@ -3,6 +3,87 @@
 -- Important: I WAS NOT THE ORIGINAL AUTHOR OF THIS PROGRAM! This was originally written by Kein-Hong Man (khman@users.sf.net),
 -- original credit goes to him and any other contributers. This program has been improved both performance wise, and syntax wise.
 
+-- Unused functions saved here for reference:
+
+--[[local function P_CreateInst(Number)
+	local OP_Code = (Number % 64);
+	local OP_Base = (Number - OP_Code) / 64;
+	local OP_A    = (OP_Base % 256);
+
+	return { OP = OP_Code, A = OP_A, Bx = (OP_Base - OP_A) / 256 };
+end;
+
+local function P_DecodeInst(String)
+	local BaseNumber = Byte(String, 1);
+
+	local OP_Code = BaseNumber % 64;
+	local OP_A    = (Byte(String, 2) * 4 + (BaseNumber - OP_Code) / 64) % 256;
+	local OP_C    = (Byte(String, 3) * 4 + (BaseNumber - OP_A)) / 256;
+	local OP_B    = (Byte(String, 4) * 2 + (BaseNumber - OP_C)) / 512;
+
+	local Instr = {};
+
+	Instr.OP = OP_Code;
+	Instr.A  = OP_A;
+	Instr.C  = OP_C;
+	
+	if OpMode[tonumber(Sub(OpModes[OP_Code], 7, 7))] ~= "iABC" then
+		Instr.Bx = OP_B * 512 + OP_C;
+	else
+		Instr.B  = OP_B;
+	end;
+	
+	return Instr;
+end;
+
+local function P_IndexK(x)
+	return x - BitRK;
+end;
+
+local function P_TestAMode(Op)
+	return (OpModes[ OpCode[Op] ] / 64) % 2;
+end;
+
+local function U_MakeFileSet(fileName)
+	local Buff = {};
+	local Port = Open(fileName, "wb");
+	
+	if not Port then
+		return;
+	end;
+
+	Buff.H = Port;
+	
+	return function(String, Buff)  -- chunk writer
+		local H = Buff.H;
+		
+		if not H then
+			return 0;
+		end;
+		
+		if not String then
+			if H:close() then
+				return 0;
+			end;
+		else
+			if H:write(String) then
+				return 0;
+			end;
+		end;
+		
+		return 1;
+	end, Buff;
+end;
+
+local function Y_AnchorToken(LexerState)
+	local Token = LexerState.T.Token;
+
+	if Token == "TK_NAME" or Token == "TK_STRING" then
+		-- not relevant to Lua implementation of parser
+		-- luaX_newstring(ls, getstr(ts), ts->tsv.len); /* C */
+	end;
+end;]]
+
 local Lua = {}; -- Main port module to interact with the system
 
 local Z = {}; -- Input reader module (Unused as all Z functions are locally defined (e.g. function: Z_MakeStringReader))
@@ -81,7 +162,8 @@ local MAXARG_C = 511;
 local BitRK      = 256;
 local MaxIndexRK = 255;
 
-local NO_REG = MAXARG_A;
+local NO_REG  = MAXARG_A;
+local NO_JUMP = -1;
 
 local Amount  = 0;
 local OpCode  = {};
@@ -90,6 +172,19 @@ local ROpCode = {};
 local OpModes = {};
 
 local OpArgMask = { OpArgN = 0, OpArgU = 1, OpArgR = 2, OpArgK = 3 };
+
+local OperatorTree = {
+	OPR_ADD = 0, OPR_SUB = 1, OPR_MUL = 2, OPR_DIV = 3, OPR_MOD = 4, OPR_POW = 5,
+	OPR_CONCAT = 6,
+	OPR_NE = 7, OPR_EQ = 8,
+	OPR_LT = 9, OPR_LE = 10, OPR_GT = 11, OPR_GE = 12,
+	OPR_AND = 13, OPR_OR = 14,
+	OPR_NOBINOPR = 15,
+};
+
+local UnaryOperatorTree = {
+	OPR_MINUS = 0, OPR_NOT = 1, OPR_LEN = 2, OPR_NOUNOPR = 3,
+};
 
 --//----------------------------------------//--
 --* Define Libraries
@@ -120,6 +215,8 @@ local Find   = string.find;
 local Lower  = string.lower;
 local Format = string.format;
 local Gmatch = string.gmatch;
+
+local Header = "\27Lua\81\0\1\4" .. Char(SizeSizeT) .. "\4\8\0";
 
 --//----------------------------------------//--
 --* String functions
@@ -927,77 +1024,47 @@ function X:llex(lexState, token)
 	end;
 end;
 
-function P:GET_OPCODE(instr)
-	return ROpCode[instr.OP];
-end;
-
-function P:SET_OPCODE(instr, op)
+local function P_SetOpcode(instr, op)
 	instr.OP = OpCode[op];
 end;
 
-function P:GETARG_A(instr)
-	return instr.A;
+local function P_IsK(x)
+	return x >= BitRK;
 end;
 
-function P:SETARG_A(instr, value)
-	instr.A = value;
+local function P_RKAsk(x)
+	return x + BitRK;
 end;
 
-function P:GETARG_B(instr)
-	return instr.B;
+local function P_GetOpMode(Op)
+	return OpModes[OpCode[Op]] % 4;
 end;
 
-function P:SETARG_B(instr, value)
-	instr.B = value;
+local function P_GetBMode(Op)
+	return (OpModes[OpCode[Op]] / 16) % 4;
 end;
 
-function P:GETARG_C(instr)
-	return instr.C;
+local function P_GetCMode(Op)
+	return (OpModes[OpCode[Op]] / 4) % 4;
 end;
 
-function P:SETARG_C(instr, value)
-	instr.C = value;
+local function P_TestTMode(Op)
+	return OpModes[OpCode[Op]] / 128;
 end;
 
-function P:GETARG_Bx(instr)
-	return instr.Bx
+local function U_MakeStringSet()
+	return function(String, Buff)  -- chunk writer
+		if not String then
+			return 0;
+		end;
+		
+		Buff.Data = Buff.Data .. String;
+		
+		return 1;
+	end, { Data = "" };
 end;
 
-function P:SETARG_Bx(instr, value)
-	instr.Bx = value;
-end;
-
-function P:GETARG_sBx(instr)
-	return instr.Bx - self.MAXARG_sBx;
-end;
-
-function P:SETARG_sBx(instr, value)
-	instr.Bx = value + self.MAXARG_sBx;
-end;
-
-function P:CREATE_ABC(op, a, b, c)
-	return { OP = OpCode[op], A = a, B = b, C = c };
-end;
-
-function P:CREATE_ABx(op, a, bx)
-	return { OP = OpCode[op], A = a, Bx = bx };
-end;
-
-------------------------------------------------------------------------
--- create an instruction from a number (for OP_SETLIST)
-------------------------------------------------------------------------
-function P:CREATE_Inst(Number)
-	local OP_Code = (Number % 64);
-	local OP_Base = (Number - OP_Code) / 64;
-	local OP_A    = (OP_Base % 256);
-
-	return { OP = OP_Code, A = OP_A, Bx = (OP_Base - OP_A) / 256 };
-end;
-
-------------------------------------------------------------------------
--- returns a 4-char string little-endian encoded form of an instruction
-------------------------------------------------------------------------
-function P:Instruction(Instruction)
+local function U_FromInstruction(Instruction)
 	local OP_Code = Instruction.OP;
 	local OP_A    = Instruction.A;
 	local OP_B    = Instruction.B;  -- Can be nil
@@ -1017,117 +1084,6 @@ function P:Instruction(Instruction)
 	local Char4 = (BaseNumber - Char3) / 256;
 	
 	return Char(Char1, Char2, Char3, Char4);
-end;
-
-------------------------------------------------------------------------
--- decodes a 4-char little-endian string into an instruction struct
-------------------------------------------------------------------------
-function P:DecodeInst(String)
-	local BaseNumber = Byte(String, 1);
-
-	local OP_Code = BaseNumber % 64;
-	local OP_A    = (Byte(String, 2) * 4 + (BaseNumber - OP_Code) / 64) % 256;
-	local OP_C    = (Byte(String, 3) * 4 + (BaseNumber - OP_A)) / 256;
-	local OP_B    = (Byte(String, 4) * 2 + (BaseNumber - OP_C)) / 512;
-
-	local Instr = {};
-
-	Instr.OP = OP_Code;
-	Instr.A  = OP_A;
-	Instr.C  = OP_C;
-	
-	if OpMode[tonumber(Sub(OpModes[OP_Code], 7, 7))] ~= "iABC" then
-		Instr.Bx = OP_B * 512 + OP_C;
-	else
-		Instr.B  = OP_B;
-	end;
-	
-	return Instr;
-end;
-
--- test whether value is a constant
-function P:IsK(x)
-	return x >= BitRK;
-end;
-
--- gets the index of the constant
-function P:IndexK(x)
-	return x - BitRK;
-end;
-
--- code a constant index as a RK value
-function P:RKAsk(x)
-	return x + BitRK;
-end;
-
-------------------------------------------------------------------------
--- e.g. to compare with symbols, luaP:getOpMode(...) == luaP.OpCode.iABC
--- * accepts opcode parameter as strings, e.g. "OP_MOVE"
-------------------------------------------------------------------------
-
-function P:GetOpMode(m)
-	return OpModes[OpCode[m]] % 4;
-end;
-
-function P:GetBMode(m)
-	return (OpModes[OpCode[m]] / 16) % 4;
-end;
-
-function P:GetCMode(m)
-	return (OpModes[OpCode[m]] / 4) % 4;
-end;
-
-function P:TestAMode(m)
-	return (OpModes[OpCode[m]] / 64) % 2;
-end;
-
-function P:TestTMode(m)
-	return OpModes[OpCode[m]] / 128;
-end;
-
-local U_DumpFunction, U_Dump;
-
-local function U_MakeStringSet()
-	return function(String, Buff)  -- chunk writer
-		if not String then
-			return 0;
-		end;
-		
-		Buff.Data = Buff.Data .. String;
-		
-		return 1;
-	end, { Data = "" };
-end;
-
-local function U_MakeFileSet(fileName)
-	local Buff = {};
-	local Port = Open(fileName, "wb");
-	
-	if not Port then
-		return;
-	end;
-
-	Buff.H = Port;
-	
-	return function(String, Buff)  -- chunk writer
-		local H = Buff.H;
-		
-		if not H then
-			return 0;
-		end;
-		
-		if not String then
-			if H:close() then
-				return 0;
-			end;
-		else
-			if H:write(String) then
-				return 0;
-			end;
-		end;
-		
-		return 1;
-	end, Buff;
 end;
 
 local function U_FromDouble(x)
@@ -1150,7 +1106,7 @@ local function U_FromDouble(x)
 	
 	local Val = "";
 	
-	local New = Floor(Mantissa);
+	local New = Mantissa - (Mantissa % 1);
 	
 	for _ = 1, 6 do
 		local __Byte = Char(New % 256);
@@ -1198,7 +1154,7 @@ end;
 
 local function U_DumpSizeT(x, D)
 	U_DumpBlock(U_FromInt(x), D);
-	
+
 	if SizeSizeT == 8 then
 		U_DumpBlock(U_FromInt(0), D);
 	end;
@@ -1214,7 +1170,7 @@ local function U_DumpString(String, D)
 	end;
 
 	String = String .. Char0;
-	
+
 	U_DumpSizeT(#String, D);
 	U_DumpBlock(String, D);
 end;
@@ -1222,13 +1178,15 @@ end;
 local function U_DumpCode(Instr, D)
 	local Size = Instr.SizeCode;
 	local Code = Instr.Code;
-	
+
 	U_DumpInt(Size, D);
-	
+
 	for Index = 0, Size - 1 do
-		U_DumpBlock(P:Instruction(Code[Index]), D);
+		U_DumpBlock(U_FromInstruction(Code[Index]), D);
 	end;
 end;
+
+local U_DumpFunction;
 
 local function U_DumpConstants(Const, D)
 	local Source = Const.Source;
@@ -1300,7 +1258,7 @@ local function U_DumpDebug(Debug, D)
 	end;
 end;
 
-function U_DumpFunction(Function, _P, D)
+U_DumpFunction = function(Function, _P, D)
 	local Source = Function.Source;
 	
 	if Source == _P or D.Strip then
@@ -1320,8 +1278,6 @@ function U_DumpFunction(Function, _P, D)
 	U_DumpDebug(Function, D);
 end;
 
-local Header = "\27Lua\81\0\1\4" .. Char(SizeSizeT) .. "\4\8\0";
-
 function U_Dump(LuaState, Function, Writer, Data, Strip)
 	local DumpState = {};  -- DumpState
 
@@ -1338,33 +1294,6 @@ function U_Dump(LuaState, Function, Writer, Data, Strip)
 	
 	return DumpState.Status;
 end;
-
-function K.Set(Object, x)
-	Object.Value = x;
-end;
-
-function K.SetNil(Object)
-	Object.Value = nil;
-end;
-
-K.SetNValue = K.Set;
-K.SetHValue = K.Set;
-K.SetBValue = K.Set;
-
-local NO_JUMP = -1;
-
-local OperatorTree = {
-	OPR_ADD = 0, OPR_SUB = 1, OPR_MUL = 2, OPR_DIV = 3, OPR_MOD = 4, OPR_POW = 5,
-	OPR_CONCAT = 6,
-	OPR_NE = 7, OPR_EQ = 8,
-	OPR_LT = 9, OPR_LE = 10, OPR_GT = 11, OPR_GE = 12,
-	OPR_AND = 13, OPR_OR = 14,
-	OPR_NOBINOPR = 15,
-};
-
-local UnaryIperatorTree = {
-	OPR_MINUS = 0, OPR_NOT = 1, OPR_LEN = 2, OPR_NOUNOPR = 3,
-};
 
 function K.GetCode(FunctionState, Expression)
 	return FunctionState.F.Code[Expression.Info];
@@ -1404,7 +1333,7 @@ function K:Nil(FunctionState, From, N)
 
 		local Previous = Code[Pc - 1];
 		
-		if P:GET_OPCODE(Previous) == "OP_LOADNIL" then
+		if ROpCode[Previous.OP] == "OP_LOADNIL" then
 			local A = Previous.A;
 			local B = Previous.B;
 			
@@ -1479,8 +1408,10 @@ function K.GetJumpControl(FunctionState, Pc)
 	local InstrA = Code[Pc];
 	local InstrB = Code[Pc - 1];
 	
+	local OP = InstrA.OP;
+	
 	if Pc >= 1 then
-		if P:TestTMode(P:GET_OPCODE(InstrA)) ~= 0 then return InstrA; end;
+		if P_TestTMode(OP) ~= 0 then return InstrA; end;
 	end;
 
 	return InstrB;
@@ -1490,7 +1421,7 @@ function K:NeedValue(FunctionState, List)
 	while List ~= NO_JUMP do
 		local JumpControl = self.GetJumpControl(FunctionState, List);
 		
-		if P:GET_OPCODE(JumpControl) ~= "OP_TESTSET" then
+		if ROpCode[JumpControl.OP] ~= "OP_TESTSET" then
 			return true;
 		end;
 		
@@ -1504,7 +1435,7 @@ function K:PatchTestReg(FunctionState, Node, Reg)
 	local JMPCtrl      = self.GetJumpControl(FunctionState, Node);
 	local JMPCtrl_ArgB = JMPCtrl;
 	
-	if P:GET_OPCODE(JMPCtrl) ~= "OP_TESTSET" then
+	if ROpCode[JMPCtrl.OP] ~= "OP_TESTSET" then
 		return false; -- cannot patch other instructions
 	end;
 	
@@ -1605,7 +1536,7 @@ function K:ReserveRegs(FunctionState, Number)
 end;
 
 function K:FreeReg(FunctionState, Reg)
-	if not P:IsK(Reg) and Reg >= FunctionState.NactVar then
+	if not P_IsK(Reg) and Reg >= FunctionState.NactVar then
 		FunctionState.FreeReg = FunctionState.FreeReg - 1;
 	end;
 end;
@@ -1632,13 +1563,11 @@ function K:AddK(FunctionState, __K, V)
 		return self:NValue(Idx);
 	end;
 
-	Idx = {};
-	
-	self:SetNValue(Idx, NK);
+	Idx = { Value = NK };
 		
 	H[Value] = Idx;
 		
-	Y:GrowVector(L, _K, NK, SizeK, nil, MAXARG_Bx, "constant table overflow");
+	Y:GrowVector(L, _K, NK, SizeK, NIL, MAXARG_Bx, "constant table overflow");
 		
 	_K[NK] = V;
 		
@@ -1853,7 +1782,7 @@ function K:Expression2RK(FunctionState, Expression)
 
 	if K == "VK" then
 		if Info <= MaxIndexRK then
-			return P:RKAsk(Info);
+			return P_RKAsk(Info);
 		end;
 	end;
 	
@@ -1867,7 +1796,7 @@ function K:Expression2RK(FunctionState, Expression)
 			
 			Expression.K = "VK";
 			
-			return P:RKAsk(Expression.Info);
+			return P_RKAsk(Expression.Info);
 		end;
 	end;
 	
@@ -1923,11 +1852,10 @@ end;
 function K:InvertJump(FunctionState, Expression)
 	local Pc = self.GetJumpControl(FunctionState, Expression.Info);
 
-	local Opcode = P:GET_OPCODE(Pc);
+	local OP     = Pc.OP;
+	local Opcode = ROpCode[OP];
 
-	lua_Assert(P:TestTMode(Opcode) ~= 0 and
-		Opcode ~= "OP_TESTSET" and
-		Opcode ~= "OP_TEST");
+	lua_Assert(P_TestTMode(OP) ~= 0 and Opcode ~= "OP_TESTSET" and Opcode ~= "OP_TEST");
 
 	Pc.A = (Pc.A == 0) and 1 or 0;
 end;
@@ -2254,7 +2182,7 @@ function K:PositionFix(FunctionState, Opcode, E1, E2)
 		local Instr = self.GetCode(FunctionState, E2);
 
 		if E2.K == "VRELOCABLE" then
-			if P:GET_OPCODE(Instr) == "OP_CONCAT" then
+			if ROpCode[Instr.OP] == "OP_CONCAT" then
 				lua_Assert(E1.Info == Instr.B - 1);
 
 				self:FreeExpression(FunctionState, E1);
@@ -2331,21 +2259,25 @@ end
 
 local MaskN = OpArgMask.OpArgN;
 
-function K:CodeABC(FunctionState, Opcode, A, B, C)
-	lua_Assert(P:GetOpMode(Opcode) == OpMode.iABC);
-	lua_Assert(P:GetBMode(OpCode) ~= MaskN or B == 0);
-	lua_Assert(P:GetCMode(OpCode) ~= MaskN or C == 0);
+local iABC  = OpMode.iABC;
+local iABx  = OpMode.iABx;
+local iAsBx = OpMode.iAsBx;
 
-	return self:Code(FunctionState, P:CREATE_ABC(Opcode, A, B, C), FunctionState.LexerState.LastLine);
+function K:CodeABC(FunctionState, Opcode, A, B, C)
+	lua_Assert(P_GetOpMode(Opcode) == iABC);
+	lua_Assert(P_GetBMode(OpCode) ~= MaskN or B == 0);
+	lua_Assert(P_GetCMode(OpCode) ~= MaskN or C == 0);
+
+	return self:Code(FunctionState, { OP = Opcode, A = A, B = B, C = C }, FunctionState.LexerState.LastLine);
 end;
 
 function K:CodeABx(FunctionState, Opcode, A, Bx)
-	local Opmode = P:GetOpMode(Opcode);
+	local Opmode = P_GetOpMode(Opcode);
 
-	lua_Assert(Opmode == OpMode.iABx or Opmode == OpMode.iAsBx);
-	lua_Assert(P:GetCMode(Opcode) == MaskN);
+	lua_Assert(Opmode == iABx or Opmode == iAsBx);
+	lua_Assert(P_GetCMode(Opcode) == MaskN);
 
-	return self:Code(FunctionState, P:CREATE_ABx(Opcode, A, Bx), FunctionState.LexerState.LastLine);
+	return self:Code(FunctionState, { OP = Opcode, A = A, Bx = Bx }, FunctionState.LexerState.LastLine);
 end;
 
 function K:SetList(FunctionState, Base, NumberOfElements, ToStore)
@@ -2359,7 +2291,10 @@ function K:SetList(FunctionState, Base, NumberOfElements, ToStore)
 		self:CodeABC(FunctionState, "OP_SETLIST", Base, B, C);
 	else
 		self:CodeABC(FunctionState, "OP_SETLIST", Base, B, 0);
-		self:Code(FunctionState, P:CREATE_Inst(C), FunctionState.LexerState.LastLine);
+
+
+
+		self:Code(FunctionState, P_CREATE_Inst(C), FunctionState.LexerState.LastLine);
 	end;
 
 	FunctionState.FreeReg = Base + 1; -- free registers with list values
@@ -2376,7 +2311,7 @@ end;
 function Y:NewProto() -- It never needed the state as an argument?
 	local FunctionState = {};
 
-	FunctionState.Source = nil;
+	FunctionState.Source = NIL;
 
 	FunctionState.LineDefined     = 0;
 	FunctionState.LastLineDefined = 0;
@@ -2427,17 +2362,6 @@ end;
 
 function Y:CheckLimit(FunctionState, Value, Limit, Message)
 	return (Value > Limit and self:ErrorLimit(FunctionState, Limit, Message)) or Value;
-end;
-
-function Y:AnchorToken()
-	--[[
-	local Token = LexerState.T.Token;
-
-	if Token == "TK_NAME" or Token == "TK_STRING" then
-		-- not relevant to Lua implementation of parser
-		-- luaX_newstring(ls, getstr(ts), ts->tsv.len); /* C */
-	end;
-	]]
 end;
 
 function Y:ErrorExpected(LexerState, Token)
@@ -2518,7 +2442,7 @@ function Y:RegisterLocalVar(LexerState, VarName)
 	local F             = LexerState.F;
 	local FunctionState = LexerState.FunctionState;
 
-	self:GrowVector(LexerState.L, F.LocVars, FunctionState.nlocvars, F.SizeLocVars, nil, self.SHRT_MAX, "too many local variables");
+	self:GrowVector(LexerState.L, F.LocVars, FunctionState.nlocvars, F.SizeLocVars, NIL, ShortMax, "too many local variables");
 	-- loop to initialize empty f.locvar positions not required
 
 	local NLocVars = FunctionState.NLocVars;
@@ -2594,7 +2518,7 @@ function luaY:indexupvalue(fs, name, v)
 	-- new one
 	self:checklimit(fs, f.nups + 1, self.LUAI_MAXUPVALUES, "upvalues")
 	self:growvector(fs.L, f.upvalues, f.nups, f.sizeupvalues,
-									nil, self.MAX_INT, "")
+	NIL, self.MAX_INT, "")
 	-- loop to initialize empty f.upvalues positions not required
 	f.upvalues[f.nups] = name
 	-- luaC_objbarrier(fs->L, f, name); /* GC */
@@ -2635,7 +2559,7 @@ end
 -- * used only in singlevar()
 ------------------------------------------------------------------------
 function luaY:singlevaraux(fs, n, var, base)
-	if fs == nil then  -- no more levels?
+	if fs == NIL then  -- no more levels?
 		self:init_exp(var, "VGLOBAL", luaP.NO_REG)  -- default is global variable
 		return "VGLOBAL"
 	else
@@ -2746,7 +2670,7 @@ end
 function luaY:pushclosure(ls, func, v)
 	local fs = ls.fs
 	local f = fs.f
-	self:growvector(ls.L, f.p, fs.np, f.sizep, nil,
+	self:growvector(ls.L, f.p, fs.np, f.sizep, NIL,
 									luaP.MAXARG_Bx, "constant table overflow")
 	-- loop to initialize empty f.p positions not required
 	f.p[fs.np] = func.f
@@ -2783,12 +2707,12 @@ function Y:OpenFunction(ls, fs)
 	fs.NLocVars = 0;
 	fs.NactVar  = 0;
 
-	fs.Bl = nil;
+	fs.Bl = NIL;
 
 	fs.H = {};  -- constant table; was luaH_new call
 
-	F.MaxStackSsizeource        = ls.source;
-	F.MaxStackSsize = 2; -- registers 0/1 are always valid
+	F.MaxStackSizeSource = ls.source;
+	F.MaxStackSize = 2; -- registers 0/1 are always valid
 end
 
 ------------------------------------------------------------------------
@@ -2813,12 +2737,12 @@ function Y:CloseFunction(ls)
 	f.SizeLocVars  = fs.NLocVars;
 	f.SizeUpvalues = f.NUps;
 
-	assert(fs.bl == nil);
+	assert(fs.bl == NIL);
 
 	ls.fs = fs.prev;
 
 	if fs then
-		self:AnchorToken(ls);
+		-- self:AnchorToken(ls); -- Doesn't exist
 	end;
 end
 
@@ -2855,8 +2779,8 @@ function Y:Parser(LuaState, Zio, Buff, Name)
 
 	lua_Assert(F.NUps == 0);
 	
-	lua_Assert(FunctionState.Prev == nil);
-	lua_Assert(FunctionState.FunctionState == nil);
+	lua_Assert(FunctionState.Prev == NIL);
+	lua_Assert(FunctionState.FunctionState == NIL);
 
 	return F;
 end
@@ -3800,7 +3724,7 @@ function luaY:exprstat(ls)
 	if v.v.k == "VCALL" then  -- stat -> func
 		luaP:SETARG_C(luaK:getcode(fs, v.v), 1)  -- call statement uses no results
 	else  -- stat -> assignment
-		v.prev = nil
+		v.prev = NIL
 		self:assignment(ls, v, 1)
 	end
 end
