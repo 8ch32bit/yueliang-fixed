@@ -5,15 +5,7 @@
 
 -- Unused functions saved here for reference:
 
---[[local function P_CreateInst(Number)
-	local OP_Code = (Number % 64);
-	local OP_Base = (Number - OP_Code) / 64;
-	local OP_A    = (OP_Base % 256);
-
-	return { OP = OP_Code, A = OP_A, Bx = (OP_Base - OP_A) / 256 };
-end;
-
-local function P_DecodeInst(String)
+--[[local function P_DecodeInst(String)
 	local BaseNumber = Byte(String, 1);
 
 	local OP_Code = BaseNumber % 64;
@@ -331,6 +323,10 @@ local function Opmode(T, A, B, C, __OpMode)
 	return Bor(Bor(T * 128, A * 64) + Bor(OpArgMaskB * 16, OpArgMaskC * 4), P.OpMode[__OpMode] + 4);
 end;
 
+--//----------------------------------------//--
+--* LuaZ: Input stream functions
+--//----------------------------------------//--
+
 local function Z_MakeStringReader(Buff)
 	return function() -- chunk reader anonymous function here
 		if not Buff then
@@ -395,11 +391,10 @@ local function Z_GetChar(Zio)
 	return Z_Fill(Zio);
 end;
 
-------------------------------------------------------------------------
--- returns a suitably-formatted chunk name or id
--- * from lobject.c, used in llex.c and ldebug.c
--- * the result, out, is returned (was first argument)
-------------------------------------------------------------------------
+--//----------------------------------------//--
+--* LuaX: Lexical analyser module
+--//----------------------------------------//--
+
 function X:GetChunkID(Source, BuffLength)
 	local Output = "";
 	local First  = Sub(Source, 1, 1);
@@ -1024,6 +1019,10 @@ function X:llex(lexState, token)
 	end;
 end;
 
+--//----------------------------------------//--
+--* LuaP: Instruction utility module
+--//----------------------------------------//--
+
 local function P_SetOpcode(instr, op)
 	instr.OP = OpCode[op];
 end;
@@ -1051,6 +1050,18 @@ end;
 local function P_TestTMode(Op)
 	return OpModes[OpCode[Op]] / 128;
 end;
+
+local function P_CreateInst(Number)
+	local OP_Code = (Number % 64);
+	local OP_Base = (Number - OP_Code) / 64;
+	local OP_A    = (OP_Base % 256);
+
+	return { OP = OP_Code, A = OP_A, Bx = (OP_Base - OP_A) / 256 };
+end;
+
+--//----------------------------------------//--
+--* LuaU: String binary dumper module
+--//----------------------------------------//--
 
 local function U_MakeStringSet()
 	return function(String, Buff)  -- chunk writer
@@ -1294,6 +1305,10 @@ function U_Dump(LuaState, Function, Writer, Data, Strip)
 	
 	return DumpState.Status;
 end;
+
+--//----------------------------------------//--
+--* LuaK: Code generator/compiler module
+--//----------------------------------------//--
 
 function K.GetCode(FunctionState, Expression)
 	return FunctionState.F.Code[Expression.Info];
@@ -2291,14 +2306,15 @@ function K:SetList(FunctionState, Base, NumberOfElements, ToStore)
 		self:CodeABC(FunctionState, "OP_SETLIST", Base, B, C);
 	else
 		self:CodeABC(FunctionState, "OP_SETLIST", Base, B, 0);
-
-
-
-		self:Code(FunctionState, P_CREATE_Inst(C), FunctionState.LexerState.LastLine);
+		self:Code(FunctionState, P_CreateInst(C), FunctionState.LexerState.LastLine);
 	end;
 
 	FunctionState.FreeReg = Base + 1; -- free registers with list values
 end;
+
+--//----------------------------------------//--
+--* LuaY: Parser module
+--//----------------------------------------//--
 
 function Y:LUA_QL(x)
 	return Format("'%s'", x);
@@ -3832,10 +3848,6 @@ function Y:chunk(ls)
 end;
 
 do
-	--//----------------------------------------//--
-	--* 
-	--//----------------------------------------//--
-
 	--//----------------------------------------//--
 	--* Init some dependencies
 	--//----------------------------------------//--
